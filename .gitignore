@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+_build/
+*.jpg
+*.png
+!docs/*.png
+.ipynb_checkpoints/

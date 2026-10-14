@@ -1,0 +1,10 @@
+# Dataset pipeline (CPU). Python 3.9-3.12 (mediapipe 0.10.14 has no 3.13 wheels).
+mediapipe==0.10.14
+opencv-python-headless>=4.8,<5
+numpy>=1.24,<2
+pandas>=2.0
+pillow>=10
+networkx>=3
+tabulate>=0.9
+requests>=2.31
+beautifulsoup4>=4.12
