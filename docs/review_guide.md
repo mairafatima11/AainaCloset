@@ -21,7 +21,8 @@ Name it `review_NNN_<name>.csv`.
 
 ## Accept only if all of these hold
 1. **Same garment.** CLOTH and PERSON show the same item, in the same colour and print.
-2. **Cloth is the front.** For `flat` pairs, the cloth is the *front* of the garment (neckline / placket visible), not the back, not a close-up.
+2. **Cloth shows the whole front.** `flat` pairs: the front flat lay, not the back or a close-up. `worn` pairs: a *different* photo of the same outfit that shows the garment front **down to the hem** (a full-length shot is best; a crop that cuts the hem off loses the kameez length).
+   For `worn` pairs also reject if the two photos are practically the same shot (same pose, same framing). Use reason 5.
 3. **Person is usable.** Facing the camera, head to (roughly) ankles in frame, not seated, arms not raised above the shoulders, garment not hidden by a bag or a hand.
 4. **Garment is visible.** For kameez pairs, at least ~2/3 of the kameez front is visible. A dupatta over one shoulder is fine; a dupatta wrapped over the chest and stomach is not.
 5. **Image quality.** Not blurred, not a collage or infographic, no text over the garment.
@@ -34,7 +35,7 @@ If the automatic choice is wrong but a better image exists in the strip, **fix i
 | 1 | `cloth_not_matching` | flat lay is the dupatta/trouser only, or a different colourway |
 | 2 | `dupatta_occludes` | dupatta covers most of the kameez in the person image |
 | 3 | `bad_pose` | side view, seated, arms up, walking stride that hides the hem |
-| 4 | `cloth_back_or_detail` | only the back or a fabric close-up exists as cloth |
+| 4 | `cloth_back_or_detail` | only the back, a fabric close-up, or a crop that hides the hem exists as cloth |
 | 5 | `low_quality` | blur, heavy crop, watermark, collage |
 | 6 | `other` | anything else, then write it in `docs/decisions.md` |
 

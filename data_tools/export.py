@@ -1,11 +1,12 @@
 """Export reviewed pairs to a VITON-HD / CatVTON style directory.
 
     <OUT>/
-      train/ image/  cloth/  cloth-mask/          (agnostic-mask/ + image-densepose/ added by masks_gpu.py)
+      train/ image/  cloth/  cloth-mask/  cloth_full/  cloth_faceless/
+             (agnostic-mask/, image-densepose/, image-parse/, cloth_cutout/ added by masks_gpu.py)
       val/   ...
       test/  ...
-      train_pairs.txt   val_pairs.txt   test_pairs.txt  test_pairs_unpaired.txt
-      train_worn_pairs.txt ...           <- 'worn' pairs kept in separate lists
+      train_pairs.txt   val_pairs.txt   test_pairs.txt  test_pairs_unpaired.txt   <- worn pairs (primary)
+      train_flat_pairs.txt  test_flat_pairs_unpaired.txt ...                    <- flat-lay pairs, separate lists
       pairs.csv                          <- every exported pair with all metadata + split
       export_log.csv
 
@@ -14,8 +15,11 @@ Brand photos are 2:3 (ETHNC, Khaadi) or 5:6 (Sapphire); they are resized to fit 
 padded with their own background colour rather than stretched or cropped.
 
 Flat-lay cloth images are cut out here on CPU (plain studio background -> threshold +
-largest components + hole filling). 'worn' cloth images need human parsing (SCHP) and are
-produced on GPU by masks_gpu.py; export writes a placeholder list for them.
+largest components + hole filling). For 'worn' pairs the garment reference is another model
+photo, written as cloth_full/ and cloth_faceless/ here; cloth_cutout/ (SCHP) is made on GPU by
+masks_gpu.py. --worn-cloth picks which one is copied into cloth/ (the folder CatVTON reads).
+cloth_person_similarity in pairs.csv flags near-identical shots (> 0.8; the one visibly near-identical Khaadi pair in the gold sample scores 0.83): keep them for
+training if you like, but leave them out when reporting paired test metrics.
 """
 from __future__ import annotations
 
@@ -112,6 +116,45 @@ def make_cloth(img: np.ndarray, mask: np.ndarray, margin: float = 0.04):
     return fit_pad(comp, fill=np.array([255, 255, 255], np.uint8)), fit_pad(m, fill=0, interp=cv2.INTER_NEAREST)
 
 
+_POSE = None
+
+
+def _pose():
+    global _POSE
+    if _POSE is None:
+        import mediapipe as mp
+        _POSE = mp.solutions.pose.Pose(static_image_mode=True, model_complexity=1)
+    return _POSE
+
+
+def faceless(img: np.ndarray, grey=(128, 128, 128)) -> np.ndarray:
+    """Hide the head (face + hair above the shoulders) of a model photo used as a garment reference.
+
+    Removes the identity cue the try-on model could copy, while keeping the whole garment
+    (neckline sits at or below the shoulder line). Falls back to the unmodified image when
+    no pose is found -- those pairs should not have passed review anyway.
+    """
+    res = _pose().process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    if not res.pose_landmarks:
+        return img
+    lm = res.pose_landmarks.landmark
+    h = img.shape[0]
+    sh_y = min(lm[11].y, lm[12].y) * h
+    ear_y = max(lm[7].y, lm[8].y) * h          # ears: lower bound of the head
+    cut = int(max(0, min(sh_y - 0.025 * h, ear_y + 0.6 * (sh_y - ear_y))))
+    out = img.copy()
+    out[:cut] = grey
+    return out
+
+
+def image_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Correlation of tiny greyscale thumbnails: ~1.0 means the two shots are almost identical."""
+    ta = cv2.resize(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), (24, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+    tb = cv2.resize(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), (24, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+    ta, tb = ta - ta.mean(), tb - tb.mean()
+    return float((ta * tb).sum() / (np.sqrt((ta ** 2).sum() * (tb ** 2).sum()) + 1e-6))
+
+
 def unpaired(names: list[str], cats: list[str], seed: int = 0) -> list[str]:
     """Deterministic derangement within each try-on category (cloth i -> person j != i)."""
     rng = random.Random(seed)
@@ -128,7 +171,8 @@ def unpaired(names: list[str], cats: list[str], seed: int = 0) -> list[str]:
     return out
 
 
-def export(pairs: pd.DataFrame, root: str, out: str, only_accepted: bool = True, overwrite: bool = False):
+def export(pairs: pd.DataFrame, root: str, out: str, only_accepted: bool = True, overwrite: bool = False,
+           worn_cloth: str = "faceless"):
     p = pairs.copy()
     if only_accepted and "decision" in p:
         p = p[p.decision == "accept"]
@@ -142,10 +186,11 @@ def export(pairs: pd.DataFrame, root: str, out: str, only_accepted: bool = True,
         name = f"{r.pair_id}.jpg"
         dst_img = os.path.join(d, "image", name)
         status = "ok"
+        person = None
         try:
             if overwrite or not os.path.exists(dst_img):
-                person = cv2.imread(os.path.join(root, r.person))
-                cv2.imwrite(dst_img, fit_pad(person), [cv2.IMWRITE_JPEG_QUALITY, 95])
+                person = fit_pad(cv2.imread(os.path.join(root, r.person)))
+                cv2.imwrite(dst_img, person, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if r.pair_type == "flat":
                 dst_c = os.path.join(d, "cloth", name)
                 if overwrite or not os.path.exists(dst_c):
@@ -158,7 +203,30 @@ def export(pairs: pd.DataFrame, root: str, out: str, only_accepted: bool = True,
                 else:
                     log_cov = np.nan
             else:
-                status, log_cov = "needs_gpu_cloth", np.nan
+                # worn: garment reference is another model photo of the same SKU.
+                #   cloth_full/      the photo as published (what a shop page shows)
+                #   cloth_faceless/  same photo, head greyed out (no identity to copy)
+                #   cloth_cutout/    garment only, made on GPU by masks_gpu.py (SCHP)
+                #   cloth/           = the variant chosen by --worn-cloth (default faceless)
+                for sub in ["cloth_full", "cloth_faceless"]:
+                    os.makedirs(os.path.join(d, sub), exist_ok=True)
+                f_full, f_fl = os.path.join(d, "cloth_full", name), os.path.join(d, "cloth_faceless", name)
+                if overwrite or not (os.path.exists(f_full) and os.path.exists(f_fl)):
+                    src = fit_pad(cv2.imread(os.path.join(root, r.cloth)))
+                    fl = faceless(src)
+                    cv2.imwrite(f_full, src, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    cv2.imwrite(f_fl, fl, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                else:
+                    src, fl = cv2.imread(f_full), cv2.imread(f_fl)
+                chosen = {"full": src, "faceless": fl}.get(worn_cloth)
+                if chosen is not None:
+                    cv2.imwrite(os.path.join(d, "cloth", name), chosen, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                sim = image_similarity(src, cv2.imread(dst_img))
+                status = "ok" if chosen is not None else "needs_gpu_cloth"
+                log_cov = np.nan
+                log.append({"pair_id": r.pair_id, "split": r.split, "status": status,
+                            "cloth_mask_coverage": log_cov, "cloth_person_similarity": round(sim, 4)})
+                continue
         except Exception as e:  # keep going, report at the end
             status, log_cov = f"error:{e!r}"[:120], np.nan
         log.append({"pair_id": r.pair_id, "split": r.split, "status": status, "cloth_mask_coverage": log_cov})
@@ -170,7 +238,7 @@ def export(pairs: pd.DataFrame, root: str, out: str, only_accepted: bool = True,
     for split, g in p[~p.status.str.startswith("error")].groupby("split"):
         for ptype, gg in g.groupby("pair_type"):
             names = [f"{x}.jpg" for x in gg.pair_id]
-            suffix = "" if ptype == "flat" else f"_{ptype}"
+            suffix = "" if ptype == "worn" else f"_{ptype}"     # worn = primary -> CatVTON's default file names
             with open(os.path.join(out, f"{split}{suffix}_pairs.txt"), "w") as fh:
                 fh.writelines(f"{n} {n}\n" for n in names)
             if split != "train":
@@ -189,8 +257,11 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--all", action="store_true", help="export without review decisions (debug only)")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--worn-cloth", choices=["faceless", "full", "cutout"], default="faceless",
+                    help="which garment variant goes into cloth/ for worn pairs (decide with notebook 04)")
     a = ap.parse_args(argv)
-    export(pd.read_csv(a.pairs), a.root, a.out, only_accepted=not a.all, overwrite=a.overwrite)
+    export(pd.read_csv(a.pairs), a.root, a.out, only_accepted=not a.all, overwrite=a.overwrite,
+           worn_cloth=a.worn_cloth)
 
 
 if __name__ == "__main__":

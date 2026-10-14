@@ -10,11 +10,11 @@ Format: *Datasheets for Datasets* (Gebru et al., 2021). Fields marked **[fill]**
 
 ## Composition
 - **Instances.** Each instance is a *pair*: a person image and a garment image of the same product, plus masks. Two types:
-  - `flat`: the garment is a brand flat-lay photo (ETHNC). This is the main training and evaluation set.
-  - `worn`: the garment is cut out of a different model photo of the same product (Khaadi, Sapphire). Reported separately.
+  - `worn` (primary, all brands): the garment image is a *different* model photo of the same product. It ships in three versions: as published, with the head greyed out, or with the garment cut out. This is the input a real shop page gives you.
+  - `flat` (secondary, ETHNC only): the garment image is the brand's flat-lay photo. It is reported separately and also used for a same-product flat vs. worn comparison.
 - **Counts.** **[fill from stats: pairs per brand × type × category × split]**
 - **Source pool.** 16,790 product images of 2,513 products from three Pakistani brands' public online stores (ETHNC, Khaadi, Sapphire), collected October 2026.
-- **Per instance.** `image/` person 768×1024; `cloth/` garment on white 768×1024; `cloth-mask/`; `agnostic-mask/`; `image-densepose/`; `image-parse/` (SCHP-LIP labels); a row in `pairs.csv` with brand, product code, design group, garment category, pair type, review decision, split and image URLs.
+- **Per instance.** `image/` person 768×1024; `cloth/` garment image 768×1024 (worn: the chosen variant; `cloth_full/`, `cloth_faceless/`, `cloth_cutout/` all kept); `cloth-mask/`; `agnostic-mask/`; `image-densepose/`; `image-parse/` (SCHP-LIP labels); a row in `pairs.csv` with brand, product code, design group, garment category, pair type, review decision, split and image URLs.
 - **Labels.** View labels (automatic, MediaPipe), pair selection (automatic, then accepted / corrected / rejected by a human reviewer with a coded reason), masks (automatic: SCHP + DensePose via CatVTON AutoMasker, plus a kameez hem extension).
 - **Splits.** Train / val / test ≈ 75 / 10 / 15 by *design group*. Colourways and re-listings of one design never cross splits.
 - **Excluded on purpose.** Children's wear and every image of a minor; footwear, perfume, home textiles; western-line products; Khaadi re-listings; byte-identical duplicates.

@@ -2,14 +2,14 @@
 
 Two pair types, kept clearly separate everywhere downstream:
 
-  flat  cloth = brand flat-lay (front), person = best front full-length model shot.
-        This is the standard VITON-HD-style pair and the core of the dataset.
-        (ETHNC is the only brand in the current scrape that publishes flat lays.)
+  worn  (primary) cloth = a DIFFERENT front-facing photo of the same SKU (ideally a full-length
+        front shot, so the hem is visible), person = the best front full-length model shot. This matches what the
+        app receives: Khaadi and Sapphire publish no flat lays, so the catalogue image IS a
+        model photo. Never the same photo for both sides. The cloth image is exported in
+        three variants (full / faceless / cutout) -- see export.py and notebook 04.
 
-  worn  cloth = garment segmented out of one model photo (done later, on GPU, with SCHP),
-        person = a *different* model photo of the same SKU. Weaker supervision: the cloth
-        is already shaped by a body. Used for Khaadi / Sapphire, for the benchmark and
-        as an optional extra training slice -- never mixed into 'flat' metrics.
+  flat  (secondary) cloth = brand flat-lay (front). ETHNC only, ~40% of its SKUs. Kept as
+        the VITON-HD-style setting and for a same-SKU comparison against 'worn'.
 
 A flat_lower (shalwar / trouser flat) gives an extra 'lower' pair when present.
 
@@ -58,10 +58,46 @@ def tryon_category(garment_type: str) -> str:
     return {"lower": "lower", "overall": "overall"}.get(garment_type, "upper")
 
 
+def cloth_source_score(r) -> float:
+    """How good is this model photo as a GARMENT reference (not as a target)?
+
+    The garment reference must show the whole front of the garment, including the hem:
+    kameez length is exactly what Western-trained models get wrong. So:
+    front full-length shot > front shot cropped below the knee > headless torso crop
+    (sharp print, but the hem is cut off). Side/back/seated/arms-up views are never used.
+    """
+    if not (r.pose_found and r.facing_camera and r.frontal > 0.68) or r.arms_raised or r.seated:
+        return 0.0
+    if r.label == "mff":
+        return 0.8 + 0.2 * r.target_score
+    if r.label == "mo" and r.head_in_frame and r.vis_knees > 0.5:
+        return 0.6 + 0.1 * min(1.0, r.frontal)
+    if r.label == "mo" and r.head_in_frame:      # 3/4 crop, hem may be cut: reviewer decides
+        return 0.4 + 0.1 * min(1.0, r.frontal)
+    if r.label == "detail":
+        return 0.3 + 0.1 * min(1.0, r.frontal)
+    return 0.0
+
+
+def _pair(base, pair_type, category, cloth, person, alt_cloth="", alt_person=""):
+    return {**base, "pair_type": pair_type, "category": category, "cloth": cloth.rel_path,
+            "person": person.rel_path, "target_score": person.target_score,
+            "cloth_score": getattr(cloth, "cloth_score", float("nan")),
+            "alt_cloth": alt_cloth, "alt_person": alt_person, "bg_plain": int(person.border_std < 18)}
+
+
 def build_pairs(cat: pd.DataFrame, views: pd.DataFrame) -> pd.DataFrame:
+    """One 'worn' pair for every SKU that has a usable target + a different front view,
+    plus a 'flat' pair (and a shalwar 'flat' pair) wherever a flat lay exists.
+
+    'worn' is the primary type: it is what the app actually receives for brands that publish
+    no flat lays (Khaadi, Sapphire, most of ETHNC). 'flat' pairs on the same ETHNC SKUs give a
+    controlled comparison of the two conditioning sources.
+    """
     df = cat.merge(views, on="rel_path", how="inner", suffixes=("", "_v"))
     df = df[~df.filename_dup.astype(bool)]
     df["split_group"] = leakage_groups(df)
+    df["cloth_score"] = df.apply(cloth_source_score, axis=1)
     ok = eligible_skus(cat)
     rows = []
     for sku, g in df.groupby("sku"):
@@ -75,33 +111,25 @@ def build_pairs(cat: pd.DataFrame, views: pd.DataFrame) -> pd.DataFrame:
         targets = g[(g.label == "mff") & (g.target_score >= TARGET_MIN_SCORE)
                     & (g[["width", "height"]].min(axis=1) >= MIN_SHORT_SIDE)]
         targets = targets.sort_values("target_score", ascending=False)
-        flats = g[g.label == "flat"]
-        lowers = g[g.label == "flat_lower"]
-        alt_targets = "|".join(targets.rel_path.iloc[1:4])
+        if targets.empty:
+            continue
+        t = targets.iloc[0]
+        alt_t = "|".join(targets.rel_path.iloc[1:4])
+        cat_ = tryon_category(meta.garment_type)
+        flats, lowers = g[g.label == "flat"], g[g.label == "flat_lower"]
 
-        if len(targets) and len(flats):
-            t = targets.iloc[0]
-            rows.append({**base, "pair_type": "flat", "category": tryon_category(meta.garment_type),
-                         "cloth": flats.iloc[0].rel_path, "person": t.rel_path,
-                         "target_score": t.target_score, "alt_cloth": "|".join(flats.rel_path.iloc[1:]),
-                         "alt_person": alt_targets, "bg_plain": int(t.border_std < 18)})
-            if len(lowers) and meta.garment_type in {"set", "lower"}:
-                rows.append({**base, "pair_type": "flat", "category": "lower",
-                             "cloth": lowers.iloc[0].rel_path, "person": t.rel_path,
-                             "target_score": t.target_score, "alt_cloth": "", "alt_person": alt_targets,
-                             "bg_plain": int(t.border_std < 18)})
-        elif len(lowers) and len(targets) and meta.garment_type == "lower":
-            t = targets.iloc[0]
-            rows.append({**base, "pair_type": "flat", "category": "lower", "cloth": lowers.iloc[0].rel_path,
-                         "person": t.rel_path, "target_score": t.target_score, "alt_cloth": "",
-                         "alt_person": alt_targets, "bg_plain": int(t.border_std < 18)})
-        elif len(targets) >= 2:
-            # garment source = 2nd best (often a slightly different pose), person = best
-            t, src = targets.iloc[0], targets.iloc[1]
-            rows.append({**base, "pair_type": "worn", "category": tryon_category(meta.garment_type),
-                         "cloth": src.rel_path, "person": t.rel_path, "target_score": t.target_score,
-                         "alt_cloth": "", "alt_person": "|".join(targets.rel_path.iloc[2:5]),
-                         "bg_plain": int(t.border_std < 18)})
+        # --- worn (primary): garment from a different front-facing photo of the same SKU
+        if meta.garment_type != "lower":
+            src = g[(g.rel_path != t.rel_path) & (g.cloth_score > 0)].sort_values("cloth_score", ascending=False)
+            if len(src):
+                rows.append(_pair(base, "worn", cat_, src.iloc[0], t,
+                                  alt_cloth="|".join(src.rel_path.iloc[1:4]), alt_person=alt_t))
+        # --- flat (secondary, ETHNC): brand flat lay
+        if len(flats) and meta.garment_type != "lower":
+            rows.append(_pair(base, "flat", cat_, flats.iloc[0], t,
+                              alt_cloth="|".join(flats.rel_path.iloc[1:]), alt_person=alt_t))
+        if len(lowers) and meta.garment_type in {"set", "lower"}:
+            rows.append(_pair(base, "flat", "lower", lowers.iloc[0], t, alt_person=alt_t))
     out = pd.DataFrame(rows)
     if len(out):
         out.insert(0, "pair_id", [f"p{i:05d}" for i in range(len(out))])

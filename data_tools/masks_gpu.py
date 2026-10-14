@@ -6,7 +6,8 @@ detectron2 install. For every exported pair it writes:
   <split>/agnostic-mask/<id>_mask.png   region the try-on model must repaint (white)
   <split>/image-densepose/<id>.jpg      DensePose render (only needed for a StableVITON fallback)
   <split>/image-parse/<id>.png          SCHP-LIP label map (kept for QA and the failure taxonomy)
-  <split>/cloth/<id>.jpg + cloth-mask/  for 'worn' pairs: garment cut out of the cloth-source photo
+  <split>/cloth_cutout/<id>.jpg (+ cloth-mask/)  for 'worn' pairs: garment cut out of the cloth-source
+                                        photo with SCHP; copied into cloth/ only if worn_cloth='cutout'
   masks_qa.csv                          per-image statistics, incl. how much dupatta covers the torso
 
 Why the mask is extended for kameez
@@ -86,17 +87,20 @@ def garment_from_person(img_bgr: np.ndarray, lip: np.ndarray, category: str) -> 
     return m
 
 
-def process(export_dir: str, root: str, catvton_repo: str, limit: int = 0, overwrite: bool = False):
+def process(export_dir: str, root: str, catvton_repo: str, limit: int = 0, overwrite: bool = False,
+            worn_cloth: str = "faceless", pair_ids: list | None = None):
     from .export import make_cloth, fit_pad
     pairs = pd.read_csv(os.path.join(export_dir, "pairs.csv"))
     pairs = pairs[~pairs.status.astype(str).str.startswith("error")]
+    if pair_ids is not None:
+        pairs = pairs[pairs.pair_id.isin(pair_ids)]
     if limit:
         pairs = pairs.head(limit)
     mk = Masker(catvton_repo)
     qa = []
     for i, r in enumerate(pairs.itertuples()):
         d = os.path.join(export_dir, r.split)
-        for sub in ["agnostic-mask", "image-densepose", "image-parse", "cloth", "cloth-mask"]:
+        for sub in ["agnostic-mask", "image-densepose", "image-parse", "cloth", "cloth-mask", "cloth_cutout"]:
             os.makedirs(os.path.join(d, sub), exist_ok=True)
         dst = os.path.join(d, "agnostic-mask", f"{r.pair_id}_mask.png")
         rec = {"pair_id": r.pair_id, "split": r.split, "pair_type": r.pair_type, "category": r.category}
@@ -121,10 +125,11 @@ def process(export_dir: str, root: str, catvton_repo: str, limit: int = 0, overw
                     rec["garment_px_frac"] = float(np.isin(lip, LIP_GARMENT_UPPER).mean())
                 rec["mask_frac"] = float((mask > 127).mean())
             if r.pair_type == "worn":
-                dst_c = os.path.join(d, "cloth", f"{r.pair_id}.jpg")
+                dst_c = os.path.join(d, "cloth_cutout", f"{r.pair_id}.jpg")
                 if overwrite or not os.path.exists(dst_c):
-                    src = cv2.imread(os.path.join(root, r.cloth))
-                    src_pad = fit_pad(src)
+                    src_pad = cv2.imread(os.path.join(d, "cloth_full", f"{r.pair_id}.jpg"))
+                    if src_pad is None:
+                        src_pad = fit_pad(cv2.imread(os.path.join(root, r.cloth)))
                     o2 = mk.run(Image.fromarray(cv2.cvtColor(src_pad, cv2.COLOR_BGR2RGB)), "upper")
                     gm = garment_from_person(src_pad, o2["schp_lip"], r.category)
                     if gm.sum() < 0.02 * gm.size:
@@ -132,6 +137,9 @@ def process(export_dir: str, root: str, catvton_repo: str, limit: int = 0, overw
                     cloth, cmask = make_cloth(src_pad, gm)
                     cv2.imwrite(dst_c, cloth, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     cv2.imwrite(os.path.join(d, "cloth-mask", f"{r.pair_id}.jpg"), cmask)
+                    rec["cutout_garment_frac"] = float(gm.mean())
+                    if worn_cloth == "cutout":
+                        cv2.imwrite(os.path.join(d, "cloth", f"{r.pair_id}.jpg"), cloth, [cv2.IMWRITE_JPEG_QUALITY, 95])
             rec["status"] = "ok"
         except Exception as e:
             rec["status"] = f"error:{e!r}"[:160]
